@@ -1,0 +1,157 @@
+---
+title: "projectDA2"
+author: "Ramson Munoz Morales"
+format: html
+editor: visual
+---
+
+# Data analysis 2 project
+
+## Loading Data
+
+```{r}
+project_data <- read.csv("data/combined_data_hourly.csv",header = T)
+```
+
+## Basic EDA
+
+```{r}
+summary(project_data)
+```
+
+## Visualization
+
+```{r}
+library(ggplot2)
+p <- ggplot(project_data,mapping=aes(x=Date,y=DA_EC))
+
+p + geom_line()
+```
+
+```{r}
+pairs(project_data[,3:ncol(project_data)])
+```
+
+## SARIMA on the data
+
+```{r}
+library(forecast)
+forecast_model <- auto.arima(project_data$RT_Demand,seasonal = T)
+summary(forecast_model)
+```
+
+Something to note. The SARIMA model assumes that all of the data necessary to forecast future values is captured by the data in history. Here we will try to forecast RT_DEMAND. But, the other factors present in the dataset are not used. Only, checking for seasonality and trends. It makes sense that a fourier series representation is used here. I understand why people consider this problem a curve fitting problem. The issue is that the method is unlikely to be very interpretable.
+
+## SARIMA now with cross validation
+
+### Pre-processing
+
+```{r}
+#install.packages("tibble")
+library(forecast)
+library(timetk)
+library(lubridate)
+project_data <- read.csv("data/combined_data_hourly.csv",header = T)
+project_data <- project_data[project_data$Date > "2018-12-31",]
+#project_data
+project_data$Date_Time <- ymd(as.Date(project_data$Date)) + hours(as.double(project_data$Hr_End) - 1)  # marking by start hour even though the time period is the same
+# reason is to keep all data within the day it belongs to for later selection
+#which(is.na(project_data))
+#colSums(is.na(project_data))
+#project_data[which(is.na(project_data$Date_Time)),c("Date","Hr_End")]
+
+project_data <- project_data[-which(is.na(project_data$Date_Time)),]
+#colSums(is.na(project_data)) #problem solved
+```
+
+We also drop the first three years since the way the features were measured changed in June of 2018. We start the data in 2019 for consistency.
+
+When creating the Date_Time variable for time series marker an issue of a NA value emerged as a result of how the daylight savings hours are recorded. In November of 24 on the third of the month an 02X representing the lost hour of spring forward is present in the data. This is also true for 11/2/25 but not present in the earlier years. It seems from ISO changed their standard. Which has been true for a few things. In this case I am going to drop these two rows only to remain consistent with the other years. Since we are fitting a model, I don't think this will play too significant an impact on model performance, but may come into play for a particular case later. I just want to note it.
+
+### Cross validation splitting and test set hold out
+
+For the SARIMA model, I only need the response variable itself and the time data. So I will create a subset of the data to serve as my complete data with that.
+
+```{r}
+sarima_subset <- project_data[,c("Date","Date_Time","RT_Demand")]
+head(sarima_subset)
+
+sarima_subset.Train <- sarima_subset[sarima_subset$Date < "2025-01-01",]
+
+sarima_subset.Test <-  sarima_subset[sarima_subset$Date >= "2025-01-01",]
+```
+
+Now to set up a sliding window cross validation with one year of training and one year of testing for each SARIMA instance.
+
+```{r}
+library(forecast)
+library(lubridate)
+library(timetk)
+library(rsample)
+library(tibble)
+library(plotly)
+
+sliding_window_cv <- time_series_cv(data=as_tibble(sarima_subset.Train),date_var = Date_Time, initial="2 years", assess = "1 year", skip= "1 year",cumulative = F, slice_limit = 4)
+
+expanding_cv <- time_series_cv(data=as_tibble(sarima_subset.Train),date_var = Date_Time, initial="2 years", assess = "1 year", skip= "1 year",cumulative = T, slice_limit = 4)
+
+p1 <- sliding_window_cv %>% plot_time_series_cv_plan(.date_var = Date_Time, .value = RT_Demand)
+p2 <- expanding_cv %>% plot_time_series_cv_plan(.date_var = Date_Time, .value = RT_Demand)
+
+htmlwidgets::saveWidget(p1, "sliding_cv_plan.html")
+htmlwidgets::saveWidget(p2, "expanding_cv_plan.html")
+```
+
+NOTE: sliding window for things like SARIMA dont follow random sampling idea from standard CV and for time series models that rely on seasonality you run into the issue of not providing enough season period.
+
+The testing window was selected to be one year to ensure that the test batch size was consistent across methods. This was to ensure the sampling distribution of the test error evaluation was closer between models reducing an element of variation in the data, essentially reducing degrees of freedom. Additionally, SARIMA benefits from capturing one degree of seasonality so a year was chosen to capture the yearly season mode. Testing batch sizes were selected to be two years to allow the fitting data to retain many examples of seasons relative to the data size.
+
+#### Limitation
+
+A note on seasons. Going forward, I define the notion of "frequency" to be a periodic pattern (fixed time interval period) in the data for a given time frame. For example, the daily frequency results from periodic fluctuations in the data by hour. Daily peak demand is a recurring periodic pattern within these data (*provide evidence for this)*. Another example on the upper bound includes yearly seasonal behavior. Within a year of data, the quarterly fluctuations in the local climate, which from the initial study last semester was shown to impact energy demand behavior via HDD and CDD (*cite yourself)*, although the results of that examination are questionable, considering the impact of this information in this context is important *potentially weak claim explore this further*.
+
+For this data, we have the option to select daily season since there is a frequency mode of daily peak. Additionally, we have the weekly peaks due to weekday vs weekend resulting in another frequency mode. And finally, we have the yearly season fluctuations. For the purposes of this analysis, we focus on weekly seasonal behavior. The rationale is simplicity. In practice, a more rigorous analysis of the important frequency modes should go into the model design process, but for the sake of time and scope of this project, I just wanted to get an example of how to run this analysis. Going forward, I want to expand this part of the project. In fact, SARIMA is known to be limited in that the model can only assume one seasonal mode in the data. Models like meta's prophet allow for different seasonal frequencies through Fourier series expansions of the data. However, that is not explored here.
+
+### Hyper-parameter search
+
+![](images/clipboard-1538960745.png)
+
+pseudo-citation: <https://otexts.com/fpp2/non-seasonal-arima.html>
+
+#### Limitation
+
+They explain some of the techniques for selecting these things yourself, but I am taking the approach of an optimization idea since my goal is to maximize predictive power. Yet, I understand that the optimization approach may not work. Back when we studied the examples of optimization ideas, we had many assumptions needed to be met to guarantee existence of an optimal point. I don't know if I have that here. I could try and examine that analytically, but for the sake of time we can chalk that up to another limitation. I don't necessarily need a PhD project to explore this problem, but having the time to fill those gaps would help. I don't know if that is a high value effort though.
+
+I am deciding to use auto.arima because I don't yet know how this works. I see that limiting the project too much could make it not useful. This is a first attempt. Hard to know what the line is. From a risk standpoint, using auto.arima may not hurt me too much. It does well for data that meet the assumptions. If the behavior is extremely poor, it may be because this isn't the right tool for the job.
+
+```{r}
+get_cv_fold_metrics <- function(split,time_interval=24){
+  fold_training <- training(split)
+  fold_validation <- testing(split)
+  fold_time_series <- ts(fold_training$RT_Demand,frequency = time_interval)
+  fold_model <- auto.arima(fold_time_series,seasonal = T,stepwise = T,approximation = T,trace=F)
+  
+  h <- nrow(fold_validation)
+  split_forecast <- forecast(fold_model,h)
+  
+  observed <- fold_validation$RT_Demand
+  predictions <- as.numeric(split_forecast$mean)
+  
+  rmse = sqrt(mean((observed - predictions)^2))
+  
+  return(list(model_order = arimaorder(fold_model), rmse=rmse, observed = observed, predicted = predictions))
+}
+
+sliding_results <- list()
+for (i in seq_along(sliding_window_cv$splits)){
+  print(paste("Fold", i, "\n"))
+  sliding_results[[i]] <- get_cv_fold_metrics(sliding_window_cv$splits[[i]])
+}
+
+expanding_results <- list()
+for (i in seq_along(expanding_cv$splits)){
+  print(paste("Fold", i, "\n"))
+  expanding_results[[i]] <- get_cv_fold_metrics(expanding_cv$splits[[i]])
+}
+
+```
