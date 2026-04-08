@@ -76,6 +76,8 @@ For the SARIMA model, I only need the response variable itself and the time data
 sarima_subset <- project_data[,c("Date","Date_Time","RT_Demand")]
 head(sarima_subset)
 
+sarima_subset
+
 sarima_subset.Train <- sarima_subset[sarima_subset$Date < "2025-01-01",]
 
 sarima_subset.Test <-  sarima_subset[sarima_subset$Date >= "2025-01-01",]
@@ -91,7 +93,7 @@ library(rsample)
 library(tibble)
 library(plotly)
 
-sliding_window_cv <- time_series_cv(data=as_tibble(sarima_subset.Train),date_var = Date_Time, initial="2 years", assess = "1 year", skip= "1 year",cumulative = F, slice_limit = 4)
+sliding_window_cv <- time_series_cv(data=as_tibble(sarima_subset.Train),date_var = Date_Time, initial="2 years", assess = "180 days", skip= "1 year",cumulative = F, slice_limit = 12)
 
 expanding_cv <- time_series_cv(data=as_tibble(sarima_subset.Train),date_var = Date_Time, initial="2 years", assess = "1 year", skip= "1 year",cumulative = T, slice_limit = 4)
 
@@ -100,6 +102,9 @@ p2 <- expanding_cv %>% plot_time_series_cv_plan(.date_var = Date_Time, .value = 
 
 htmlwidgets::saveWidget(p1, "sliding_cv_plan.html")
 htmlwidgets::saveWidget(p2, "expanding_cv_plan.html")
+
+p1
+p2
 ```
 
 NOTE: sliding window for things like SARIMA dont follow random sampling idea from standard CV and for time series models that rely on seasonality you run into the issue of not providing enough season period.
@@ -142,12 +147,14 @@ get_cv_fold_metrics <- function(split,time_interval=24){
   return(list(model_order = arimaorder(fold_model), rmse=rmse, observed = observed, predicted = predictions))
 }
 
+print(paste("CV Sliding for SARIMA"))
 sliding_results <- list()
 for (i in seq_along(sliding_window_cv$splits)){
   print(paste("Fold", i, "\n"))
   sliding_results[[i]] <- get_cv_fold_metrics(sliding_window_cv$splits[[i]])
 }
 
+print(paste("CV Cummulative for SARIMA"))
 expanding_results <- list()
 for (i in seq_along(expanding_cv$splits)){
   print(paste("Fold", i, "\n"))
