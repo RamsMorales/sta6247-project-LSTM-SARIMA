@@ -1,0 +1,139 @@
+---
+title: "eda"
+format: html
+editor: visual
+---
+
+## EDA and other gubbins
+
+```{r}
+project_data
+```
+
+## Box plot of the data
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+#install.packages("patchwork")
+library(patchwork)
+boxplot_data <- project_data %>% mutate(hour = as.integer(Hr_End), month = month(Date_Time, label = T, abbr = T))
+                                        
+p1 <- ggplot(boxplot_data, aes(x=factor(hour), y = RT_Demand)) + geom_boxplot(outlier.size= 0.4, outlier.alpha = 0.2, fill = "#4E79A7") + 
+  labs(x = "Hour ending", y = "RT_Demand (MW)", title = "Real-time demand by hour of day", subtitle = "ISO New England, 2019-2025") + theme_minimal(base_size = 11)
+  
+p2 <-  ggplot(boxplot_data, aes(x=month, y = RT_Demand)) + geom_boxplot(outlier.size= 0.4, outlier.alpha = 0.2, fill = "#4E79A7") + 
+  labs(x = "Month", y = "RT_Demand (MW)", title = "Real-time demand by month", subtitle = "ISO New England, 2019-2025") + theme_minimal(base_size = 11)
+
+p3 <- ggplot(boxplot_data, aes(x=month, y = Dry_Bulb)) + geom_boxplot(outlier.size= 0.4, outlier.alpha = 0.2, fill = "#E15759") + 
+  labs(x = "Month", y = "Dry-bulb temperature (°F)", title = "Temperature by month") + theme_minimal(base_size = 11)
+
+p1 / (p2 | p3)
+```
+
+## Plotting the Series at yearly, weekly, and daily scale
+
+### Yearly
+
+```{r}
+library(ggplot2)
+
+ggplot(project_data,aes(x=Date_Time,y=RT_Demand)) + geom_line(color="#4E79A7") + labs(x = "Date", y = "RT_Demand (MW)", title = "Real-time demand by hour of day", subtitle = "ISO New England, 2019-2025") + theme_minimal(base_size = 11)
+```
+
+### Weekly
+
+```{r}
+
+one_week <- project_data %>% filter(Date_Time >= as.POSIXct("2024-07-15 00:00:00") & Date_Time < as.POSIXct("2024-07-22 00:00:00"))
+
+ggplot(one_week,aes(x=Date_Time,y=RT_Demand)) + geom_line(color="#4E79A7") + labs(x = NULL, y = "RT_Demand (MW)", title = "Hourly demand, week of Jul 15 2024") + theme_minimal(base_size = 11) + theme(axis.text.x = element_text(angle=45, hjust =1))
+```
+
+### Weekly heatmap shows seasonality on two fronts
+
+```{r}
+weekly_HEAT <- project_data %>% 
+  mutate(
+    dow = wday(Date_Time, label= T, week_start = 1),
+    hour = hour(Date_Time)
+  ) %>%
+  group_by(dow,hour) %>%
+  summarize(mean_demand = mean(RT_Demand, na.rm=T), .groups="drop")
+
+ggplot(weekly_HEAT, aes(x=hour,y=dow,fill=mean_demand)) + geom_tile()+  scale_fill_viridis_c(name = "Mean\ndemand(MW)") + scale_x_continuous(breaks= seq(0,23,by=3)) + labs(x="Hour of day", y = NULL, title = "Mean demand by day of week and hour of day") + theme_minimal()
+```
+
+### Overlayed week
+
+```{r}
+weekcycle <- project_data %>%
+  mutate(
+    hour_of_week = wday(Date_Time, week_start = 1) * 24 +
+                   hour(Date_Time) - 24,   # 0..167
+    week_id = floor_date(Date_Time, unit = "week", week_start = 1)
+  )
+
+ggplot(weekcycle, aes(x = hour_of_week, y = RT_Demand, group = week_id)) +
+  geom_line(alpha = 0.05, color = "#4E79A7") +
+  scale_x_continuous(
+    breaks = seq(12, 156, by = 24),
+    labels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+  ) +
+  labs(x = NULL, y = "RT Demand (MW)",
+       title = "All weeks overlaid, 2019–2025",
+       subtitle = "Each line is one week (168 hourly points)") +
+  theme_minimal()
+```
+
+### Hourly
+
+```{r}
+df_daily_overlay <- project_data %>%
+  mutate(
+    hour = hour(Date_Time),
+    date = as.Date(Date_Time)
+  )
+
+ggplot(df_daily_overlay, aes(x = hour, y = RT_Demand)) +
+  geom_line(aes(group = date), alpha = 0.02, color = "#4E79A7") +
+  stat_summary(fun = median, geom = "line", size = 1.2, color = "#C44E52") +
+  scale_x_continuous(
+    breaks = seq(0, 23, by = 3),
+    labels = c("12a", "3a", "6a", "9a", "12p", "3p", "6p", "9p")
+  ) +
+  labs(x = "Hour of day", y = "RT Demand (MW)",
+       title = "Daily demand cycle — all days overlaid, 2019–2025",
+       subtitle = "Blue: individual days · Red: median across all days") +
+  theme_minimal()
+```
+
+## Statistical Test to justify SARIMA model
+
+```{r}
+library(tseries)
+library(forecast)
+#install.packages("feasts")
+library(feasts)
+library(tsibble)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+ts_response <- project_data %>% as_tsibble(index = Date_Time) %>% fill_gaps() %>% mutate(RT_Demand = zoo::na.approx(RT_Demand,na.rm=F))
+
+## ADF H0 non-stationary
+adf_raw <- adf.test(project_data$RT_Demand, alternative = "stationary")
+adf_raw
+
+## KPSS H0 stationsary
+kpss_raw <- kpss.test(project_data$RT_Demand, null = "Level")
+kpss_raw
+
+## Seasonal decomp
+ts_response %>%
+  model(STL(RT_Demand~season(period=24) + season(period=168) + season(period = 8760),robust = T)) %>%
+  components() %>%
+  autoplot()
+```

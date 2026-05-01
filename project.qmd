@@ -17,6 +17,8 @@ project_data <- read.csv("data/combined_data_hourly.csv",header = T)
 
 ```{r}
 summary(project_data)
+boxplot(project_data$RT_Demand)
+pairs(project_data[,3:ncol(project_data)])
 ```
 
 ## Visualization
@@ -30,6 +32,10 @@ p + geom_line()
 
 ```{r}
 pairs(project_data[,3:ncol(project_data)])
+```
+
+```{r}
+
 ```
 
 ## SARIMA on the data
@@ -86,6 +92,40 @@ sarima_subset.Test <-  sarima_subset[sarima_subset$Date >= "2025-01-01",]
 Now to set up a sliding window cross validation with one year of training and one year of testing for each SARIMA instance.
 
 ```{r}
+library(dplyr)
+library(ggplot2)
+
+plot_subset <- sarima_subset[sarima_subset$Date >= "2025-01-01",]
+
+ggplot(plot_subset,aes(x=Date_Time,y=RT_Demand)) + geom_line(color="#0072CE") + theme_bw() + labs(title="Hourly RT_Demand of Energy in MW for SEMA 2025",x="",y="RT_Demand (MW)")
+
+radial_heat_map_df <- sarima_subset %>% mutate(
+    year = year(Date_Time),
+    month = month(Date_Time),
+    week = isoweek(Date_Time),
+    day_of_week = wday(Date_Time, label = FALSE),
+    hour = hour(Date_Time)
+  )
+
+yearly_agg <- radial_heat_map_df %>%
+  group_by(year, week) %>%
+  summarise(RT_Demand = mean(RT_Demand), .groups = "drop")
+
+ggplot(yearly_agg, aes(x = week, y = factor(year), fill = RT_Demand)) +
+  geom_tile() +
+  scale_x_continuous(breaks = c(1, 5, 9, 14, 18, 22, 27, 31, 36, 40, 44, 48),labels = month.abb)+
+  coord_polar(start = 0) +
+  scale_fill_gradient(low = "white", high = "#0072CE") + 
+  labs(title = "Yearly RT_Demand by Week") +
+  theme_void() +
+  theme(
+  legend.position = "bottom",
+  axis.text.x = element_text(size = 8)
+)
+
+```
+
+```{r}
 library(forecast)
 library(lubridate)
 library(timetk)
@@ -93,18 +133,46 @@ library(rsample)
 library(tibble)
 library(plotly)
 
-sliding_window_cv <- time_series_cv(data=as_tibble(sarima_subset.Train),date_var = Date_Time, initial="2 years", assess = "180 days", skip= "1 year",cumulative = F, slice_limit = 12)
+sliding_window_cv <- time_series_cv(data=as_tibble(sarima_subset.Train),date_var = Date_Time, initial="2 years", assess = "24 hours", skip= "3 days",cumulative = F, slice_limit = 4)
 
-expanding_cv <- time_series_cv(data=as_tibble(sarima_subset.Train),date_var = Date_Time, initial="2 years", assess = "1 year", skip= "1 year",cumulative = T, slice_limit = 4)
+expanding_cv <- time_series_cv(data=as_tibble(sarima_subset.Train),date_var = Date_Time, initial="2 years", assess = "24 hours", skip= "3 days",cumulative = T, slice_limit = 4)
 
-p1 <- sliding_window_cv %>% plot_time_series_cv_plan(.date_var = Date_Time, .value = RT_Demand)
-p2 <- expanding_cv %>% plot_time_series_cv_plan(.date_var = Date_Time, .value = RT_Demand)
+library(timetk)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
 
-htmlwidgets::saveWidget(p1, "sliding_cv_plan.html")
-htmlwidgets::saveWidget(p2, "expanding_cv_plan.html")
+# replace RT_Demand with your actual value column name
+value_col <- "RT_Demand"
 
-p1
-p2
+p_slide <- sliding_window_cv %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(
+    .date_var    = Date_Time,
+    .value       = !!sym(value_col),
+    .title       = "Sliding Window",
+    .interactive = FALSE
+  ) +
+  theme(legend.position = "none",
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())
+
+p_expand <- expanding_cv %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(
+    .date_var    = Date_Time,
+    .value       = !!sym(value_col),
+    .title       = "Expanding Window",
+    .interactive = FALSE
+  ) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())
+
+# stacked for the tall left placeholder
+p_slide / p_expand +
+  plot_annotation(title = "Cross-Validation Fold Structure")
 ```
 
 NOTE: sliding window for things like SARIMA dont follow random sampling idea from standard CV and for time series models that rely on seasonality you run into the issue of not providing enough season period.
@@ -143,8 +211,9 @@ get_cv_fold_metrics <- function(split,time_interval=24){
   predictions <- as.numeric(split_forecast$mean)
   
   rmse = sqrt(mean((observed - predictions)^2))
+  AIC.fold <- split_forecast$aic
   
-  return(list(model_order = arimaorder(fold_model), rmse=rmse, observed = observed, predicted = predictions))
+  return(list(model_order = arimaorder(fold_model), rmse=rmse, foldaic = AIC.fold ,observed = observed, predicted = predictions))
 }
 
 print(paste("CV Sliding for SARIMA"))
@@ -161,4 +230,173 @@ for (i in seq_along(expanding_cv$splits)){
   expanding_results[[i]] <- get_cv_fold_metrics(expanding_cv$splits[[i]])
 }
 
+```
+
+```{r}
+library(dplyr)
+sliding_results <- readRDS("24_hr_cv_sliding_results.rds")
+expanding_results <- readRDS("24_hr_cv_expanding_results.rds")
+
+# Combined dataframe with RMSE and order per fold
+cv_summary <- data.frame(
+  fold = rep(1:length(sliding_results), 2),
+  rmse = c(
+    sapply(sliding_results, \(x) x$rmse),
+    sapply(expanding_results, \(x) x$rmse)
+  ),
+  order = c(
+    sapply(sliding_results, \(x) paste(x$model_order, collapse = ",")),
+    sapply(expanding_results, \(x) paste(x$model_order, collapse = ","))
+  ),
+  cv_type = rep(c("Sliding", "Expanding"), each = length(sliding_results))
+)
+
+# Average RMSE per CV strategy
+avg_rmse <- cv_summary %>%
+  group_by(cv_type) %>%
+  summarize(avg = mean(rmse))
+
+# Plot
+library(ggplot2)
+ggplot(cv_summary, aes(x = fold, y = rmse, color = cv_type)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(data = avg_rmse, aes(yintercept = avg, color = cv_type), linetype = "dashed") +
+  labs(x = "Fold", y = "RMSE", title = "RMSE per Fold by Method") +
+  theme_minimal()
+```
+
+```{r}
+# Best order per CV strategy (by mean RMSE, filtered to orders with >= 5 folds)
+best_orders <- cv_summary %>%
+  group_by(cv_type, order) %>%
+  summarise(
+    n_folds = n(),
+    avg_rmse = mean(rmse),
+    .groups = "drop"
+  ) %>%
+  filter(n_folds >= 5) %>%
+  arrange(cv_type, avg_rmse)
+
+best_orders
+```
+
+Expanding did better which makes sense since more historical data means a better fit. This is an estimate of the model selection process and expanding with the auto arima basedo n
+
+Post discussion and continued learning
+
+Further analysis reveals that we are actually estimating the the model selection process of using auto.arima with AIC to and the stated hyperparams to the modeling process. This is cool and unique to what I was expecting. But, it does mean that the final model fitting is better served by running the same auto.arima now with the full data set.
+
+so we will make a change to the testing process now that refits the model for every test. This essentially now acts like a leave one out procedure for the out of sample tests. We will have to see how that looks at the end. I think that the analysis between the models will be a little bit more nuanced than I expect right now.
+
+```{r}
+library(forecast)
+
+train_data <- sarima_subset.Train$RT_Demand
+test_data <- sarima_subset.Test$RT_Demand
+test_dates <- sarima_subset.Test$Date_Time
+
+n_days <- 365
+all_predictions <- numeric(n_days * 24)
+
+for (i in 1:n_days) {
+  # Build ts from all available data up to this point
+  current_ts <- ts(train_data, frequency = season_frequency)
+  
+  # Fit model
+  fit <- auto.arima(current_ts,seasonal = T,stepwise = T,approximation = T,trace=F)
+  
+  # Forecast next 24 hours
+  fc <- forecast(fit, h = 24)
+  
+  # Store predictions
+  idx <- ((i - 1) * 24 + 1):(i * 24)
+  all_predictions[idx] <- as.numeric(fc$mean)
+  
+  # Append actual observations to training data for next iteration
+  train_data <- c(train_data, test_data[idx])
+  
+  if (i %% 50 == 0) cat("Day", i, "of", n_days, "\n")
+}
+saveRDS(all_predictions,"SARIMA_TEST_PREDICTIONS.rds")
+# Evaluate
+observed <- test_data
+rmse <- sqrt(mean((observed - all_predictions)^2))
+cat("Rolling 24h RMSE:", rmse, "\n")
+
+length(observed)
+length(all_predictions)
+
+# Plot
+visualization <- data.frame(
+  Actual = observed,
+  Predicted = all_predictions[1:length(all_predictions) - 1],
+  Dates = test_dates
+)
+
+ggplot(visualization, aes(Dates)) +
+  geom_line(aes(y = Actual), color = "blue") +
+  geom_line(aes(y = Predicted), color = "gold") +
+  theme_bw()
+
+rmse
+
+ss_res = mean(((observed-all_predictions[1:length(all_predictions) - 1])^2))
+ss_tot = var(observed)
+r_sqr = 1 - (ss_res/ss_tot)
+ggplot(visualization,aes(x=Actual,y=Predicted)) + geom_point(alpha=0.3,size=0.3) + geom_smooth(method="lm", se=T) + labs(x = ) + theme_bw()
+
+mean(sarima_subset.Test$RT_Demand)
+var(sarima_subset.Test$RT_Demand)
+summary(project_data)
+
+ggplot(project_data, aes(x=RT_Demand, y = "")) + geom_boxplot(fill="steelblue",col="black") + theme_classic() + labs(title="Distribution of RT_Demand", subtitle = "SEMA 2019 - 2025", x="") + theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+```
+
+```{r}
+library(patchwork)
+p_top <- ggplot(visualization, aes(x = Dates)) +
+  geom_line(aes(y = Actual,    color = "Actual"),    linewidth = 0.4) +
+  geom_line(aes(y = Predicted, color = "Predicted"),
+            linetype = "dashed", linewidth = 0.4) +
+  scale_color_manual(values = c("Actual" = "steelblue", "Predicted" = "red")) +
+  labs(
+    title    = "Final Model | 2025 Holdout | Rolling 24h Forecast",
+    subtitle = sprintf("RMSE: %.1f MW | R\u00b2: %.3f", rmse, r_sqr),
+    x = "Hour", y = "RT Demand (MW)", color = NULL
+  ) +
+  theme_classic() +
+  theme(legend.position = c(0.92, 0.85),
+        legend.background = element_rect(fill = "white", color = "black"))
+
+
+p_bot <- ggplot(visualization, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.3, size = 0.3, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title    = "Final Model | 2025 Holdout | Actual vs Predicted",
+    subtitle = sprintf("R\u00b2: %.3f", r_sqr),
+    x = "Actual RT Demand (MW)", y = "Predicted RT Demand (MW)"
+  ) +
+  theme_classic()
+
+(p_top / p_bot) + plot_annotation(
+  title = "SARIMA",
+  theme = theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5))
+)
+```
+
+But a value on its own may not be that comparable so lets look at the plot of predictions vs results
+
+There may be over fitting here. I don't know how 270 MW RMSE compares to other models. There may be instances like sudden spikes that the model may not be able to handle. Right now the model looks at a 24 hour look ahead. If we are to trust the model fitting procedures order params
+
+## Post analysis
+
+Ljung-box test is important for making sure the autocorrelation is there
+
+```{r}
+Box.test(all_predictions[1:length(all_predictions) - 1],lag=3,type = "Ljung-Box")
+arimaorder(fit)
 ```
